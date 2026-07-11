@@ -91,8 +91,11 @@ const SkeletonViewer = forwardRef<SkeletonViewerRef, { onBoneSelect: (b: BoneInf
     return (
       <View style={styles.root} {...pan.panHandlers}>
         <Animated.View style={[StyleSheet.absoluteFill, { transform: [{ perspective: 900 }, { rotateY: rotDeg }] }]}>
-          <Svg viewBox="0 0 200 730" style={StyleSheet.absoluteFill} preserveAspectRatio="xMidYMid meet">
+          {/* viewBox compresses 730-unit skeleton into 438 units so full body fits the screen */}
+          <Svg viewBox="0 0 200 438" style={StyleSheet.absoluteFill} preserveAspectRatio="xMidYMid meet">
             <BoneGrads />
+            {/* scale(1, 0.6) maps all y-coords (0–730) into 0–438 */}
+            <G transform="scale(1, 0.6)">{/* inner */}
 
             {/* ── SKULL ─────────────────────────────────────────────────────── */}
             {B("skull", { name: "Skull", latinName: "Calvaria", region: "skull", boneId: "skull" },
@@ -354,6 +357,7 @@ const SkeletonViewer = forwardRef<SkeletonViewerRef, { onBoneSelect: (b: BoneInf
               </>
             )}
 
+            </G>{/* end scale */}
           </Svg>
         </Animated.View>
       </View>
