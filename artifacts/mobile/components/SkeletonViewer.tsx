@@ -1,679 +1,487 @@
 /**
- * SkeletonViewer — Full-body 3D skeleton.
- * Native (iOS/Android): expo-gl + Three.js with anatomically correct geometry.
- * Web (preview only): interactive 2D diagram fallback.
+ * SkeletonViewer — Medical-illustration-style interactive skeleton.
+ * Drawn in react-native-svg (works in Expo Go + web).
+ * Each bone is individually tappable; selected bone highlights orange.
+ * Drag left/right to rotate (simulates 3D via perspective skew).
  */
-import React, { forwardRef, useCallback, useImperativeHandle, useRef, useState } from "react";
-import { Platform, PanResponder, StyleSheet, Text, TouchableOpacity, View } from "react-native";
-import { GLView } from "expo-gl";
-import * as THREE from "three";
+import React, { forwardRef, useImperativeHandle, useRef, useState } from "react";
+import { Animated, PanResponder, StyleSheet, View } from "react-native";
+import Svg, {
+  Defs, G, LinearGradient, Stop,
+  Path, Ellipse, Rect, Circle, Line,
+} from "react-native-svg";
 
 // ─── Public types ────────────────────────────────────────────────────────────
-
 export interface BoneInfo {
   name: string;
   latinName: string;
   region: string;
   boneId: string;
 }
-
 export interface SkeletonViewerRef {
   resetView: () => void;
-  setMode: (mode: string) => void;
+  setMode: (m: string) => void;
 }
 
-// ─── Material helpers ────────────────────────────────────────────────────────
+// ─── Colors ──────────────────────────────────────────────────────────────────
+const C = {
+  bg:      "#1e1e2e",
+  stroke:  "#b89840",
+  dark:    "#8c6c20",
+  cavity:  "#1a1530",   // eye sockets, nasal opening
+  cart:    "#7cc8c8",   // cartilage
+  sel:     "#ff8800",   // selected
+  selDark: "#cc6600",
+};
+const SW = 0.8; // default stroke-width
 
-const BONE_COLOR  = 0xEDD9A3; // warm ivory/bone
-const CART_COLOR  = 0x7CC8C8; // cartilage: cyan
-const SEL_COLOR   = 0xFF8800; // orange highlight
-
-// ─── Procedural bone texture (Haversian canal pattern + lacunae) ─────────────
-let _boneTexture: THREE.DataTexture | null = null;
-function getBoneTexture(): THREE.DataTexture {
-  if (_boneTexture) return _boneTexture;
-  const W = 128, H = 512;
-  const data = new Uint8Array(W * H * 4);
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 4;
-      // Longitudinal striations along bone axis
-      const stripe = Math.sin(x * 0.55) * 9 + Math.sin(x * 1.9 + y * 0.04) * 5;
-      // Fine surface detail / micro-roughness
-      const bump = Math.sin(x * 4.3 + y * 0.35) * 3.5 + Math.cos(x * 2.9 + y * 0.72) * 2.5;
-      // Lacunae — tiny oval pits where osteocytes live
-      const lx = ((x % 17) - 8.5), ly = ((y % 22) - 11);
-      const lacuna = Math.exp(-(lx * lx * 0.35 + ly * ly * 0.2)) * 22;
-      // Osteon rings (Haversian system) — subtle circular banding
-      const osteon = Math.sin(Math.sqrt((x % 40 - 20) ** 2 + (y % 40 - 20) ** 2) * 0.55) * 6;
-      const v = stripe + bump + osteon - lacuna;
-      data[i]   = Math.min(255, Math.max(185, 237 + v));
-      data[i+1] = Math.min(255, Math.max(165, 218 + v));
-      data[i+2] = Math.min(255, Math.max(120, 162 + v * 0.65));
-      data[i+3] = 255;
-    }
-  }
-  _boneTexture = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
-  _boneTexture.wrapS = THREE.RepeatWrapping;
-  _boneTexture.wrapT = THREE.RepeatWrapping;
-  _boneTexture.needsUpdate = true;
-  return _boneTexture;
-}
-
-function boneMat(color = BONE_COLOR): THREE.MeshStandardMaterial {
-  return new THREE.MeshStandardMaterial({
-    color, roughness: 0.58, metalness: 0.04,
-    map: getBoneTexture(),
-  });
-}
-function cartMat(): THREE.MeshStandardMaterial {
-  return new THREE.MeshStandardMaterial({
-    color: CART_COLOR, roughness: 0.4, metalness: 0.0,
-  });
-}
-
-// ─── Geometry helpers ────────────────────────────────────────────────────────
-
-/**
- * Long bone via LatheGeometry — gives the real tapered shaft with flared ends.
- * profile: array of [radius, heightFraction] from bottom (0) to top (1).
- */
-function latheBone(height: number, profile: [r: number, t: number][], segs = 22): THREE.Mesh {
-  const pts = profile.map(([r, t]) => new THREE.Vector2(r, t * height));
-  const geo = new THREE.LatheGeometry(pts, segs);
-  geo.computeVertexNormals();
-  return new THREE.Mesh(geo, boneMat());
-}
-
-/** Small cartilage disc between bones */
-function cart(r: number, h = 0.07): THREE.Mesh {
-  return new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 14), cartMat());
-}
-
-/** Sphere mesh */
-function sph(r: number, ws = 16, hs = 12): THREE.Mesh {
-  return new THREE.Mesh(new THREE.SphereGeometry(r, ws, hs), boneMat());
-}
-
-/** Box mesh */
-function bx(w: number, h: number, d: number): THREE.Mesh {
-  return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), boneMat());
-}
-
-/** Curved rib via TubeGeometry on a CatmullRom spline */
-function createRib(side: 1 | -1, width: number, drop: number): THREE.Mesh {
-  const s = side;
-  const curve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(s * 0.22, 0, 0.05),
-    new THREE.Vector3(s * width * 0.55, drop * 0.3, 0.35),
-    new THREE.Vector3(s * width * 0.95, drop * 0.65, 0.62),
-    new THREE.Vector3(s * width * 0.82, drop, 0.88),
-    new THREE.Vector3(s * 0.28, drop * 1.05, 1.05),
-  ]);
-  const geo = new THREE.TubeGeometry(curve, 18, 0.055, 7, false);
-  return new THREE.Mesh(geo, boneMat());
-}
-
-// ─── Skeleton build ──────────────────────────────────────────────────────────
-
-interface BoneEntry { group: THREE.Group; info: BoneInfo; meshes: THREE.Mesh[] }
-
-function buildSkeleton(): { root: THREE.Group; entries: BoneEntry[] } {
-  const root = new THREE.Group();
-  const entries: BoneEntry[] = [];
-
-  function addBone(info: BoneInfo, build: (g: THREE.Group) => void): THREE.Group {
-    const g = new THREE.Group();
-    build(g);
-    root.add(g);
-    const meshes: THREE.Mesh[] = [];
-    g.traverse(o => { if (o instanceof THREE.Mesh) meshes.push(o); });
-    entries.push({ group: g, info, meshes });
-    return g;
-  }
-
-  // ─── SKULL ─────────────────────────────────────────────────────────────────
-  addBone({ name: "Skull", latinName: "Calvaria", region: "skull", boneId: "skull" }, g => {
-    // Cranium — sphere with forehead flattening
-    const cranium = sph(0.9, 20, 16);
-    cranium.scale.set(1, 1.12, 0.92);
-    cranium.position.set(0, 0.3, -0.05);
-
-    // Zygomatic arches
-    for (const sx of [-1, 1]) {
-      const zarch = new THREE.Mesh(
-        new THREE.TorusGeometry(0.5, 0.055, 5, 16, Math.PI * 0.5),
-        boneMat(),
-      );
-      zarch.rotation.x = Math.PI / 2;
-      zarch.position.set(sx * 0.68, -0.08, 0.28);
-      g.add(zarch);
-    }
-
-    // Nasal bone ridge
-    const nasal = bx(0.18, 0.3, 0.18);
-    nasal.position.set(0, 0.05, 0.82);
-
-    // Mandible
-    const mand = bx(0.86, 0.3, 0.68);
-    mand.position.set(0, -0.62, 0.15);
-    // Rami
-    for (const sx of [-1, 1]) {
-      const ramus = bx(0.16, 0.55, 0.22);
-      ramus.position.set(sx * 0.38, -0.45, -0.15);
-      g.add(ramus);
-    }
-
-    g.add(cranium, nasal, mand);
-    g.position.set(0, 9.4, 0);
-  });
-
-  // ─── VERTEBRAL COLUMN ──────────────────────────────────────────────────────
-
-  // Cervical (7) — small, slightly lordotic
-  const cervicoProfile: [number, number][] = [[0.26,0],[0.28,0.45],[0.27,0.55],[0.26,1]];
-  for (let i = 0; i < 7; i++) {
-    addBone({ name: `C${i+1} Vertebra`, latinName: `Vertebra cervicalis ${i+1}`, region: "vertebral-column", boneId: i===0?"atlas":i===1?"axis":"typical-cervical" }, g => {
-      const body = latheBone(0.22, cervicoProfile, 10);
-      const proc = bx(0.62, 0.08, 0.46); proc.position.set(0, 0, -0.28);
-      const spinous = bx(0.1, 0.08, 0.34); spinous.position.set(0, 0, -0.55);
-      g.add(body, proc, spinous);
-      g.position.set(0, 8.0 - i * 0.36, i * 0.04); // slight lordosis
-    });
-  }
-
-  // Thoracic (12) — medium, kyphotic
-  const thoraProfile: [number, number][] = [[0.28,0],[0.30,0.4],[0.31,0.6],[0.28,1]];
-  for (let i = 0; i < 12; i++) {
-    addBone({ name: `T${i+1} Vertebra`, latinName: `Vertebra thoracica ${i+1}`, region: "vertebral-column", boneId: "typical-thoracic" }, g => {
-      const body = latheBone(0.25, thoraProfile, 10);
-      const proc = bx(0.68, 0.09, 0.52); proc.position.set(0, 0, -0.3);
-      const spinous = bx(0.1, 0.42, 0.1); spinous.position.set(0, -0.22, -0.55);
-      g.add(body, proc, spinous);
-      g.position.set(0, 5.5 - i * 0.34, -(i * 0.03)); // slight kyphosis
-    });
-  }
-
-  // Lumbar (5) — large, lordotic
-  const lumbarProfile: [number, number][] = [[0.33,0],[0.36,0.4],[0.37,0.6],[0.34,1]];
-  for (let i = 0; i < 5; i++) {
-    addBone({ name: `L${i+1} Vertebra`, latinName: `Vertebra lumbalis ${i+1}`, region: "vertebral-column", boneId: "typical-lumbar" }, g => {
-      const body = latheBone(0.3, lumbarProfile, 10);
-      const proc = bx(0.78, 0.1, 0.58); proc.position.set(0, 0, -0.35);
-      const spinous = bx(0.14, 0.45, 0.14); spinous.position.set(0, -0.2, -0.58);
-      g.add(body, proc, spinous);
-      g.position.set(0, 1.45 - i * 0.38, i * 0.02);
-    });
-  }
-
-  // Sacrum
-  addBone({ name: "Sacrum", latinName: "Os sacrum", region: "vertebral-column", boneId: "sacrum" }, g => {
-    const s = latheBone(1.0, [[0.42,0],[0.44,0.3],[0.38,0.7],[0.26,1]], 12);
-    g.add(s);
-    g.position.set(0, -0.6, 0);
-  });
-
-  // ─── RIBCAGE ───────────────────────────────────────────────────────────────
-  const ribWidths = [1.05,1.22,1.38,1.50,1.60,1.66,1.68,1.65,1.58,1.48,1.32,1.1];
-  const ribDrops  = [0.1, 0.15,0.2, 0.28,0.35,0.4, 0.42,0.42,0.4, 0.38,0.32,0.25];
-  for (let i = 0; i < 12; i++) {
-    const y = 5.38 - i * 0.34;
-    for (const sx of [-1, 1] as (1|-1)[]) {
-      addBone({ name: i < 2 ? "First Rib" : "Rib", latinName: `Costa ${i+1}`, region: "thorax", boneId: i===0?"first-rib":"typical-rib" }, g => {
-        const rib = createRib(sx, ribWidths[i]!, ribDrops[i]!);
-        g.add(rib);
-        g.position.set(0, y, 0);
-      });
-    }
-  }
-
-  // ─── STERNUM ───────────────────────────────────────────────────────────────
-  addBone({ name: "Sternum", latinName: "Sternum", region: "thorax", boneId: "sternum" }, g => {
-    const manu = latheBone(0.62, [[0.32,0],[0.36,0.4],[0.34,1]], 12); manu.position.y = 1.0;
-    const body  = latheBone(1.55, [[0.26,0],[0.28,0.5],[0.25,1]], 12); body.position.y = 0.22;
-    const xiph  = latheBone(0.38, [[0.14,0],[0.18,0.5],[0.08,1]], 8); xiph.position.y = -1.0;
-    g.add(manu, body, xiph);
-    g.position.set(0, 5.55, 1.0);
-  });
-
-  // ─── CLAVICLES ─────────────────────────────────────────────────────────────
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Clavicle", latinName: "Clavicula", region: "upper-limb", boneId: "clavicle" }, g => {
-      // S-shaped clavicle using TubeGeometry
-      const curve = new THREE.CatmullRomCurve3([
-        new THREE.Vector3(0, 0, 0),
-        new THREE.Vector3(sx * 0.5, 0.05, -0.08),
-        new THREE.Vector3(sx * 1.2, 0.0,  0.12),
-        new THREE.Vector3(sx * 1.7, -0.06, 0.05),
-      ]);
-      const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 14, 0.1, 9, false), boneMat());
-      g.add(tube);
-      g.position.set(0, 7.35, 0.2);
-    });
-  }
-
-  // ─── SCAPULAE ──────────────────────────────────────────────────────────────
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Scapula", latinName: "Scapula", region: "upper-limb", boneId: "scapula" }, g => {
-      const blade = bx(1.15, 1.45, 0.1); blade.rotation.y = sx * 0.15;
-      const spine = bx(1.0, 0.1, 0.32); spine.position.set(0, 0.6, -0.2);
-      const acromion = bx(0.35, 0.1, 0.28); acromion.position.set(sx * 0.52, 0.7, -0.08);
-      const coracoid = new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.12,0.45,8), boneMat());
-      coracoid.rotation.x = Math.PI / 4;
-      coracoid.position.set(sx * 0.35, 0.4, 0.3);
-      g.add(blade, spine, acromion, coracoid);
-      g.position.set(sx * 2.28, 6.4, -0.5);
-    });
-  }
-
-  // ─── HUMERI ────────────────────────────────────────────────────────────────
-  // Proper profile: wide head → surgical neck → shaft → condyles
-  const humerusProfile: [number, number][] = [
-    [0.30,0],[0.34,0.05],[0.22,0.12],   // condyle→shaft
-    [0.18,0.3],[0.18,0.55],[0.19,0.75], // shaft
-    [0.24,0.86],[0.28,0.92],             // greater tubercle
-    [0.16,0.95],[0.35,1.0],              // neck + head
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Humerus", latinName: "Humerus", region: "upper-limb", boneId: "humerus" }, g => {
-      const bone = latheBone(2.6, humerusProfile, 20);
-      bone.position.y = -1.3;
-      g.add(bone);
-      g.position.set(sx * 2.35, 6.2, 0);
-      g.rotation.z = sx * 0.14;
-    });
-  }
-
-  // ─── RADII ─────────────────────────────────────────────────────────────────
-  const radiusProfile: [number, number][] = [
-    [0.24,0],[0.20,0.05],[0.13,0.14],[0.12,0.45],[0.12,0.75],[0.15,0.9],[0.2,1.0],
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Radius", latinName: "Radius", region: "upper-limb", boneId: "radius" }, g => {
-      const bone = latheBone(1.9, radiusProfile, 16);
-      bone.position.y = -0.95;
-      g.add(bone);
-      g.position.set(sx * 2.42, 3.4, 0);
-    });
-  }
-
-  // ─── ULNAE ─────────────────────────────────────────────────────────────────
-  const ulnaProfile: [number, number][] = [
-    [0.12,0],[0.14,0.08],[0.10,0.18],[0.09,0.5],[0.09,0.8],[0.10,0.92],[0.24,1.0],
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Ulna", latinName: "Ulna", region: "upper-limb", boneId: "ulna" }, g => {
-      const bone = latheBone(2.0, ulnaProfile, 14);
-      bone.position.y = -1.0;
-      // Olecranon
-      const olec = bx(0.22, 0.32, 0.2); olec.position.set(0, 0.18, -0.12);
-      g.add(bone, olec);
-      g.position.set(sx * (2.42 - sx * 0.22), 3.4, 0);
-    });
-  }
-
-  // ─── HANDS (simplified) ───────────────────────────────────────────────────
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Hand Bones", latinName: "Ossa manus", region: "upper-limb", boneId: "radius" }, g => {
-      // Carpals
-      const carp = bx(0.58, 0.28, 0.45); carp.position.set(0, 0, 0);
-      // Metacarpals
-      for (let i = -2; i <= 2; i++) {
-        const mc = latheBone(0.65, [[0.06,0],[0.08,0.5],[0.07,1]], 8);
-        mc.position.set(i * 0.11, -0.5, 0);
-        g.add(mc);
-      }
-      // Proximal phalanges
-      for (let i = -2; i <= 2; i++) {
-        const pp = latheBone(0.4, [[0.055,0],[0.065,0.5],[0.055,1]], 8);
-        pp.position.set(i * 0.11, -0.95, 0);
-        g.add(pp);
-      }
-      g.add(carp);
-      g.position.set(sx * 2.5, 1.2, 0);
-    });
-  }
-
-  // ─── PELVIS ────────────────────────────────────────────────────────────────
-  addBone({ name: "Pelvis", latinName: "Pelvis", region: "lower-limb", boneId: "hip-bone" }, g => {
-    // Iliac body
-    const ilium = bx(2.5, 0.75, 0.85); ilium.position.y = 0.35;
-    // Iliac crest — use torus segment
-    const crest = new THREE.Mesh(
-      new THREE.TorusGeometry(1.25, 0.12, 6, 24, Math.PI),
-      boneMat(),
-    );
-    crest.rotation.x = Math.PI / 2;
-    crest.position.set(0, 0.75, 0);
-    // Ischium / pubis
-    const isch = bx(0.72, 0.65, 0.72); isch.position.set(0, -0.42, 0);
-    // Pubic symphysis
-    const pub = bx(0.3, 0.45, 0.3); pub.position.set(0, -0.3, 0.5);
-    // Acetabula (hip sockets)
-    for (const sx of [-1, 1]) {
-      const ace = new THREE.Mesh(
-        new THREE.SphereGeometry(0.4, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.6),
-        cartMat(),
-      );
-      ace.position.set(sx * 1.05, -0.15, 0);
-      g.add(ace);
-    }
-    g.add(ilium, crest, isch, pub);
-    g.position.set(0, -0.95, 0);
-  });
-
-  // ─── FEMORA ────────────────────────────────────────────────────────────────
-  // The most visually important bone — use a very detailed profile
-  const femurProfile: [number, number][] = [
-    [0.36,0.00],[0.38,0.04],[0.28,0.08], // distal condyle
-    [0.20,0.14],[0.19,0.35],              // shaft lower
-    [0.19,0.55],[0.20,0.72],              // shaft upper
-    [0.24,0.80],[0.38,0.88],              // greater trochanter
-    [0.16,0.94],[0.34,1.00],              // neck + head
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" }, g => {
-      const bone = latheBone(4.0, femurProfile, 24);
-      bone.position.y = -2.0;
-      // Femoral neck rotated in
-      bone.rotation.z = sx * 0.08;
-      // Lesser trochanter bump
-      const lt = sph(0.14); lt.position.set(sx * -0.2, -0.5, 0);
-      g.add(bone, lt);
-      g.position.set(sx * 0.76, -0.5, 0);
-    });
-  }
-
-  // ─── PATELLAE ──────────────────────────────────────────────────────────────
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Patella", latinName: "Patella", region: "lower-limb", boneId: "patella" }, g => {
-      const p = sph(0.22, 12, 10); p.scale.set(1.1, 0.9, 0.55);
-      g.add(p);
-      g.position.set(sx * 0.8, -4.7, 0.4);
-    });
-  }
-
-  // ─── TIBIAE ────────────────────────────────────────────────────────────────
-  const tibiaProfile: [number, number][] = [
-    [0.30,0],[0.34,0.04],[0.26,0.10], // malleolus + distal
-    [0.20,0.18],[0.19,0.45],           // shaft lower/mid
-    [0.21,0.72],[0.30,0.88],           // shaft upper + metaphysis
-    [0.42,0.96],[0.44,1.00],           // tibial plateau
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" }, g => {
-      const bone = latheBone(3.6, tibiaProfile, 22);
-      bone.position.y = -1.8;
-      // Tibial tuberosity
-      const tt = bx(0.15, 0.28, 0.16); tt.position.set(0, -0.55, 0.23);
-      // Medial malleolus
-      const mm = sph(0.17); mm.position.set(sx * -0.1, -3.5, 0);
-      g.add(bone, tt, mm);
-      g.position.set(sx * 0.76, -4.55, 0);
-    });
-  }
-
-  // ─── FIBULAE ───────────────────────────────────────────────────────────────
-  const fibulaProfile: [number, number][] = [
-    [0.16,0],[0.18,0.04],[0.08,0.1],[0.07,0.5],[0.07,0.9],[0.14,1.0],
-  ];
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Fibula", latinName: "Fibula", region: "lower-limb", boneId: "fibula" }, g => {
-      const bone = latheBone(3.4, fibulaProfile, 12);
-      bone.position.y = -1.7;
-      g.add(bone);
-      g.position.set(sx * (0.76 + sx * 0.26), -4.55, 0);
-    });
-  }
-
-  // ─── FEET (simplified but recognizable) ────────────────────────────────────
-  for (const sx of [-1, 1] as (1|-1)[]) {
-    addBone({ name: "Foot Bones", latinName: "Ossa pedis", region: "lower-limb", boneId: "tibia" }, g => {
-      // Calcaneus
-      const calc = bx(0.6, 0.36, 0.9); calc.position.set(0, 0, 0.2);
-      // Talus
-      const talus = sph(0.25); talus.position.set(0, 0.22, 0.5);
-      // Navicular/cuboid
-      const mid = bx(0.54, 0.25, 0.5); mid.position.set(0, 0.1, 0.95);
-      // Metatarsals
-      for (let i = -2; i <= 2; i++) {
-        const mt = latheBone(0.8, [[0.055,0],[0.07,0.5],[0.065,1]], 8);
-        mt.rotation.x = -Math.PI / 2 - 0.15;
-        mt.position.set(i * 0.1, 0.08, 1.45 + Math.abs(i) * 0.05);
-        g.add(mt);
-      }
-      g.add(calc, talus, mid);
-      g.position.set(sx * 0.76, -8.2, 0.25);
-    });
-  }
-
-  return { root, entries };
-}
-
-// ─── Web 2D Fallback ────────────────────────────────────────────────────────
-
-const WEB_BONES: { info: BoneInfo; style: object }[] = [
-  { info: { name: "Skull", latinName: "Calvaria", region: "skull", boneId: "skull" }, style: { top: "1%", left: "38%", width: "22%", height: "10%" } },
-  { info: { name: "Clavicle", latinName: "Clavicula", region: "upper-limb", boneId: "clavicle" }, style: { top: "11%", left: "22%", width: "55%", height: "3%" } },
-  { info: { name: "Sternum", latinName: "Sternum", region: "thorax", boneId: "sternum" }, style: { top: "14%", left: "44%", width: "12%", height: "14%" } },
-  { info: { name: "Rib", latinName: "Costa", region: "thorax", boneId: "typical-rib" }, style: { top: "14%", left: "22%", width: "54%", height: "14%" } },
-  { info: { name: "Humerus", latinName: "Humerus", region: "upper-limb", boneId: "humerus" }, style: { top: "14%", left: "14%", width: "9%", height: "18%" } },
-  { info: { name: "Humerus", latinName: "Humerus", region: "upper-limb", boneId: "humerus" }, style: { top: "14%", right: "14%", width: "9%", height: "18%" } },
-  { info: { name: "Radius", latinName: "Radius", region: "upper-limb", boneId: "radius" }, style: { top: "32%", left: "10%", width: "9%", height: "16%" } },
-  { info: { name: "Radius", latinName: "Radius", region: "upper-limb", boneId: "radius" }, style: { top: "32%", right: "10%", width: "9%", height: "16%" } },
-  { info: { name: "Pelvis", latinName: "Pelvis", region: "lower-limb", boneId: "hip-bone" }, style: { top: "40%", left: "28%", width: "42%", height: "10%" } },
-  { info: { name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" }, style: { top: "50%", left: "28%", width: "16%", height: "22%" } },
-  { info: { name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" }, style: { top: "50%", right: "28%", width: "16%", height: "22%" } },
-  { info: { name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" }, style: { top: "72%", left: "30%", width: "13%", height: "22%" } },
-  { info: { name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" }, style: { top: "72%", right: "30%", width: "13%", height: "22%" } },
-];
-
-function WebFallback({ onBoneSelect }: { onBoneSelect: (b: BoneInfo | null) => void }) {
-  const [sel, setSel] = useState<string | null>(null);
-  function tap(info: BoneInfo) {
-    const key = info.boneId + info.region;
-    if (sel === key) { setSel(null); onBoneSelect(null); }
-    else { setSel(key); onBoneSelect(info); }
-  }
+// ─── Gradient helpers ─────────────────────────────────────────────────────────
+function BoneGrads() {
   return (
-    <View style={{ flex: 1, backgroundColor: "#1e1e2e", position: "relative" }}>
-      {WEB_BONES.map((b, i) => {
-        const key = b.info.boneId + b.info.region + i;
-        const active = sel === b.info.boneId + b.info.region;
-        return (
-          <TouchableOpacity
-            key={key}
-            onPress={() => tap(b.info)}
-            style={[
-              styles.webBone,
-              b.style as any,
-              active && styles.webBoneActive,
-            ]}
-          >
-            {active && (
-              <Text style={styles.webBoneLabel} numberOfLines={1}>
-                {b.info.name}
-              </Text>
-            )}
-          </TouchableOpacity>
-        );
-      })}
-      <Text style={styles.webHint}>3D rendering active on device (Expo Go)</Text>
-    </View>
+    <Defs>
+      {/* Default bone: warm ivory, light on left, shadow on right */}
+      <LinearGradient id="bg" x1="0" y1="0" x2="1" y2="0">
+        <Stop offset="0"   stopColor="#f8edcc" stopOpacity="1" />
+        <Stop offset="0.4" stopColor="#edd9a3" stopOpacity="1" />
+        <Stop offset="1"   stopColor="#c9a870" stopOpacity="1" />
+      </LinearGradient>
+      {/* Selected: orange */}
+      <LinearGradient id="sel" x1="0" y1="0" x2="1" y2="0">
+        <Stop offset="0"   stopColor="#ffb040" stopOpacity="1" />
+        <Stop offset="0.5" stopColor="#ff8800" stopOpacity="1" />
+        <Stop offset="1"   stopColor="#cc5500" stopOpacity="1" />
+      </LinearGradient>
+      {/* Cartilage: cyan */}
+      <LinearGradient id="cart" x1="0" y1="0" x2="1" y2="0">
+        <Stop offset="0" stopColor="#a0e0e0" stopOpacity="1" />
+        <Stop offset="1" stopColor="#5cb8b8" stopOpacity="1" />
+      </LinearGradient>
+    </Defs>
   );
 }
 
-// ─── Main Component ──────────────────────────────────────────────────────────
+// ─── Bone component ────────────────────────────────────────────────────────--
+interface BProps {
+  info: BoneInfo;
+  selected: boolean;
+  onPress: () => void;
+  children: React.ReactNode;
+}
+function Bone({ info, selected, onPress, children }: BProps) {
+  const fill = selected ? "url(#sel)" : "url(#bg)";
+  const stroke = selected ? C.selDark : C.stroke;
+  return (
+    <G
+      fill={fill}
+      stroke={stroke}
+      strokeWidth={selected ? SW * 1.4 : SW}
+      onPress={onPress}
+    >
+      {children}
+    </G>
+  );
+}
 
+// ─── Draw helpers ─────────────────────────────────────────────────────────────
+// Long bone: rounded rect shaft + circles for epiphyses
+function LongBone({
+  x, y, w, h, headR, footR,
+  angle = 0,
+}: { x: number; y: number; w: number; h: number; headR: number; footR: number; angle?: number }) {
+  return (
+    <G transform={angle ? `rotate(${angle},${x},${y})` : undefined}>
+      <Rect x={x - w / 2} y={y} width={w} height={h} rx={w / 2} />
+      <Circle cx={x} cy={y}     r={headR} />
+      <Circle cx={x} cy={y + h} r={footR} />
+    </G>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 const SkeletonViewer = forwardRef<SkeletonViewerRef, { onBoneSelect: (b: BoneInfo | null) => void }>(
   function SkeletonViewer({ onBoneSelect }, ref) {
-
-    // Web fallback (expo-gl needs native WebGL not available in the preview iframe)
-    if (Platform.OS === "web") {
-      return <WebFallback onBoneSelect={onBoneSelect} />;
-    }
-
-    return <NativeViewer onBoneSelect={onBoneSelect} ref={ref} />;
-  },
-);
-
-// Inner native component (uses hooks freely)
-const NativeViewer = forwardRef<SkeletonViewerRef, { onBoneSelect: (b: BoneInfo | null) => void }>(
-  function NativeViewer({ onBoneSelect }, ref) {
-    const skeletonRef  = useRef<THREE.Group | null>(null);
-    const cameraRef    = useRef<THREE.PerspectiveCamera | null>(null);
-    const entriesRef   = useRef<BoneEntry[]>([]);
-    const selectedRef  = useRef<BoneEntry | null>(null);
-    const rotRef       = useRef({ x: 0.05, y: 0.5 });
-    const autoRef      = useRef(true);
-    const idleRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const viewSizeRef  = useRef({ w: 1, h: 1 });
-    const prevDeltaRef = useRef({ dx: 0, dy: 0 });
-    const isTapRef     = useRef(false);
+    const [sel, setSel] = useState<string | null>(null);
+    const rotX = useRef(new Animated.Value(0)).current;
+    const panRef = useRef({ dx: 0 });
+    const isTapRef = useRef(false);
 
     useImperativeHandle(ref, () => ({
-      resetView: () => {
-        rotRef.current = { x: 0.05, y: 0.5 };
-        autoRef.current = true;
-        deselectAll();
-        selectedRef.current = null;
-        onBoneSelect(null);
-      },
+      resetView: () => { setSel(null); onBoneSelect(null); Animated.spring(rotX, { toValue: 0, useNativeDriver: true }).start(); },
       setMode: () => {},
     }));
 
-    function deselectAll() {
-      entriesRef.current.forEach(e =>
-        e.meshes.forEach(m => {
-          const mat = m.material as THREE.MeshStandardMaterial;
-          mat.color.setHex(BONE_COLOR);
-        }),
-      );
-    }
-
-    function selectEntry(entry: BoneEntry | null) {
-      deselectAll();
-      selectedRef.current = entry;
-      if (entry) {
-        entry.meshes.forEach(m =>
-          (m.material as THREE.MeshStandardMaterial).color.setHex(SEL_COLOR),
-        );
-        onBoneSelect(entry.info);
-      } else {
-        onBoneSelect(null);
-      }
-    }
-
-    const handleTap = useCallback((lx: number, ly: number) => {
-      if (!cameraRef.current) return;
-      const { w, h } = viewSizeRef.current;
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(
-        new THREE.Vector2((lx / w) * 2 - 1, -(ly / h) * 2 + 1),
-        cameraRef.current,
-      );
-      const allMeshes = entriesRef.current.flatMap(e => e.meshes);
-      const hits = raycaster.intersectObjects(allMeshes);
-      if (hits.length > 0) {
-        const hitMesh = hits[0]!.object as THREE.Mesh;
-        const entry = entriesRef.current.find(e => e.meshes.includes(hitMesh)) ?? null;
-        selectEntry(entry === selectedRef.current ? null : entry);
-      } else {
-        selectEntry(null);
-      }
-    }, []);
-
-    const panResponder = useRef(PanResponder.create({
+    const pan = useRef(PanResponder.create({
       onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder:  () => true,
-      onPanResponderGrant: () => {
-        autoRef.current = false;
-        isTapRef.current = true;
-        prevDeltaRef.current = { dx: 0, dy: 0 };
-        if (idleRef.current) clearTimeout(idleRef.current);
-      },
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => { isTapRef.current = true; panRef.current.dx = 0; },
       onPanResponderMove: (_, g) => {
-        const ddx = g.dx - prevDeltaRef.current.dx;
-        const ddy = g.dy - prevDeltaRef.current.dy;
-        prevDeltaRef.current = { dx: g.dx, dy: g.dy };
-        if (Math.abs(ddx) > 2 || Math.abs(ddy) > 2) isTapRef.current = false;
-        rotRef.current.y += ddx * 0.011;
-        rotRef.current.x = Math.max(-1.1, Math.min(1.1, rotRef.current.x + ddy * 0.011));
+        if (Math.abs(g.dx) > 4) isTapRef.current = false;
+        rotX.setValue(g.dx * 0.4);
       },
-      onPanResponderRelease: (e) => {
-        if (isTapRef.current) {
-          handleTap(e.nativeEvent.locationX, e.nativeEvent.locationY);
-        }
-        idleRef.current = setTimeout(() => { autoRef.current = true; }, 5000);
+      onPanResponderRelease: (_, g) => {
+        Animated.spring(rotX, { toValue: 0, useNativeDriver: true, friction: 6 }).start();
       },
     })).current;
 
-    const onContextCreate = useCallback((gl: any) => {
-      const w = gl.drawingBufferWidth;
-      const h = gl.drawingBufferHeight;
+    function select(info: BoneInfo) {
+      const key = info.boneId + info.region;
+      if (sel === key) {
+        setSel(null);
+        onBoneSelect(null);
+      } else {
+        setSel(key);
+        onBoneSelect(info);
+      }
+    }
 
-      const renderer = new THREE.WebGLRenderer({
-        canvas: {
-          width: w, height: h, style: {},
-          addEventListener: () => {}, removeEventListener: () => {},
-          clientWidth: w, clientHeight: h,
-        } as unknown as HTMLCanvasElement,
-        context: gl as unknown as WebGLRenderingContext,
-        antialias: true,
-      });
-      renderer.setSize(w, h);
-      renderer.setPixelRatio(1);
-      renderer.setClearColor(0x1e1e2e, 1);
-      renderer.shadowMap.enabled = true;
+    function isSelected(info: BoneInfo) {
+      return sel === info.boneId + info.region;
+    }
 
-      const scene = new THREE.Scene();
-      scene.fog = new THREE.FogExp2(0x1e1e2e, 0.025);
+    function B(info: BoneInfo, children: React.ReactNode) {
+      return (
+        <Bone key={info.boneId + info.region} info={info} selected={isSelected(info)} onPress={() => select(info)}>
+          {children}
+        </Bone>
+      );
+    }
 
-      const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 100);
-      camera.position.set(0, 2.0, 22);
-      cameraRef.current = camera;
-
-      // Warm operating-room lighting
-      const ambient = new THREE.AmbientLight(0xfff8f0, 0.42);
-      const keyLight = new THREE.DirectionalLight(0xfff5e8, 1.5);
-      keyLight.position.set(5, 12, 10);
-      const fillLight = new THREE.DirectionalLight(0x8899cc, 0.4);
-      fillLight.position.set(-8, 0, -5);
-      const rimLight = new THREE.DirectionalLight(0xffeedd, 0.3);
-      rimLight.position.set(0, -8, -10);
-      scene.add(ambient, keyLight, fillLight, rimLight);
-
-      // Skeleton
-      const { root, entries } = buildSkeleton();
-      root.position.set(0, -1.2, 0);
-      scene.add(root);
-      skeletonRef.current = root;
-      entriesRef.current = entries;
-
-      // RAF loop
-      const animate = () => {
-        requestAnimationFrame(animate);
-        if (autoRef.current && root) rotRef.current.y += 0.007;
-        if (root) {
-          root.rotation.x = rotRef.current.x;
-          root.rotation.y = rotRef.current.y;
-        }
-        renderer.render(scene, camera);
-        gl.endFrameEXP();
-      };
-      animate();
-    }, []);
-
+    // ── SVG viewport: 200 × 730, skeleton from y=0 (head) to y=710 (feet) ──
     return (
-      <View
-        style={styles.root}
-        {...panResponder.panHandlers}
-        onLayout={e => {
-          const { width, height } = e.nativeEvent.layout;
-          viewSizeRef.current = { w: width, h: height };
-        }}
-      >
-        <GLView style={StyleSheet.absoluteFill} onContextCreate={onContextCreate} />
+      <View style={styles.root} {...pan.panHandlers}>
+        <Animated.View style={[StyleSheet.absoluteFill, { transform: [{ perspective: 800 }, { rotateY: rotX.interpolate({ inputRange: [-180, 180], outputRange: ["-22deg", "22deg"] }) }] }]}>
+          <Svg viewBox="0 0 200 730" style={StyleSheet.absoluteFill} preserveAspectRatio="xMidYMid meet">
+            <BoneGrads />
+
+            {/* ── SKULL ── */}
+            {B({ name: "Skull", latinName: "Calvaria", region: "skull", boneId: "skull" },
+              <>
+                {/* Cranium */}
+                <Path d="M100,4 C130,4 154,18 158,42 C162,66 155,86 142,94 C134,99 120,103 100,104 C80,103 66,99 58,94 C45,86 38,66 42,42 C46,18 70,4 100,4 Z" />
+                {/* Zygomatic arches (cheekbones) */}
+                <Path d="M56,72 C50,70 44,70 40,74 C38,77 40,82 48,83 C52,84 57,82 60,79 Z" />
+                <Path d="M144,72 C150,70 156,70 160,74 C162,77 160,82 152,83 C148,84 143,82 140,79 Z" />
+                {/* Eye sockets */}
+                <Ellipse cx={83} cy={67} rx={15} ry={12} fill={C.cavity} stroke={C.dark} />
+                <Ellipse cx={117} cy={67} rx={15} ry={12} fill={C.cavity} stroke={C.dark} />
+                {/* Nasal aperture */}
+                <Path d="M94,80 C94,88 96,92 100,93 C104,92 106,88 106,80 L103,76 L100,74 L97,76 Z" fill={C.cavity} stroke={C.dark} />
+                {/* Maxilla / upper jaw ridge */}
+                <Path d="M68,100 C78,108 88,110 100,110 C112,110 122,108 132,100 Z" />
+                {/* Mandible */}
+                <Path d="M66,103 C56,106 49,114 50,124 L54,142 L72,152 L100,156 L128,152 L146,142 L150,124 C151,114 144,106 134,103 L122,100 L100,102 L78,100 Z" />
+              </>
+            )}
+
+            {/* ── CERVICAL SPINE (7) ── */}
+            {([...Array(7)].map((_, i) =>
+              B({ name: `C${i + 1} Vertebra`, latinName: `Vertebra cervicalis ${i + 1}`, region: "vertebral-column", boneId: i === 0 ? "atlas" : i === 1 ? "axis" : "typical-cervical" },
+                <>
+                  <Rect x={87} y={159 + i * 9.5} width={26} height={7} rx={2} />
+                  <Path d={`M100,${163 + i * 9.5} L100,${168 + i * 9.5}`} stroke={C.dark} strokeWidth={0.6} />
+                  {/* Transverse processes */}
+                  <Path d={`M87,${162 + i * 9.5} L78,${163 + i * 9.5}`} strokeWidth={0.5} />
+                  <Path d={`M113,${162 + i * 9.5} L122,${163 + i * 9.5}`} strokeWidth={0.5} />
+                </>
+              )
+            ))}
+
+            {/* ── THORACIC SPINE (12) ── */}
+            {([...Array(12)].map((_, i) =>
+              B({ name: `T${i + 1} Vertebra`, latinName: `Vertebra thoracica ${i + 1}`, region: "vertebral-column", boneId: "typical-thoracic" },
+                <>
+                  <Rect x={86} y={225 + i * 11} width={28} height={8.5} rx={2} />
+                  <Path d={`M100,${231 + i * 11} L100,${239 + i * 11}`} stroke={C.dark} strokeWidth={0.6} />
+                </>
+              )
+            ))}
+
+            {/* ── LUMBAR SPINE (5) ── */}
+            {([...Array(5)].map((_, i) =>
+              B({ name: `L${i + 1} Vertebra`, latinName: `Vertebra lumbalis ${i + 1}`, region: "vertebral-column", boneId: "typical-lumbar" },
+                <>
+                  <Rect x={84} y={358 + i * 13} width={32} height={10} rx={2} />
+                  <Path d={`M100,${365 + i * 13} L100,${373 + i * 13}`} stroke={C.dark} strokeWidth={0.7} />
+                </>
+              )
+            ))}
+
+            {/* ── SACRUM ── */}
+            {B({ name: "Sacrum", latinName: "Os sacrum", region: "vertebral-column", boneId: "sacrum" },
+              <Path d="M84,423 C83,430 87,450 92,466 C94,472 100,475 100,475 C100,475 106,472 108,466 C113,450 117,430 116,423 Z" />
+            )}
+
+            {/* ── COCCYX ── */}
+            {B({ name: "Coccyx", latinName: "Os coccygis", region: "vertebral-column", boneId: "sacrum" },
+              <Path d="M96,475 C97,480 98,490 100,495 C102,490 103,480 104,475 Z" />
+            )}
+
+            {/* ── RIBS — 12 pairs, drawn as arcs using Path ── */}
+            {([
+              { w: 34, d: 6, y: 228 }, { w: 42, d: 8,  y: 239 }, { w: 50, d: 10, y: 250 },
+              { w: 57, d: 12, y: 261 }, { w: 62, d: 14, y: 272 }, { w: 65, d: 16, y: 283 },
+              { w: 66, d: 18, y: 294 }, { w: 65, d: 18, y: 305 }, { w: 62, d: 16, y: 316 },
+              { w: 57, d: 14, y: 327 }, { w: 50, d: 12, y: 338 }, { w: 42, d: 10, y: 349 },
+            ].map((rib, i) =>
+              <G key={`rib${i}`}>
+                {/* Left rib */}
+                {B({ name: i < 2 ? "First Rib" : "Rib", latinName: `Costa ${i + 1}`, region: "thorax", boneId: i === 0 ? "first-rib" : "typical-rib" },
+                  <Path d={`M92,${rib.y} C80,${rib.y} ${100 - rib.w},${rib.y + rib.d * 0.5} ${100 - rib.w + 4},${rib.y + rib.d} C${100 - rib.w + 10},${rib.y + rib.d + 2} 88,${rib.y + rib.d * 0.8} 92,${rib.y + 3}`}
+                    fill="none" strokeWidth={i < 2 ? 2 : 1.8} />
+                )}
+                {/* Right rib */}
+                {B({ name: i < 2 ? "First Rib" : "Rib", latinName: `Costa ${i + 1}`, region: "thorax", boneId: i === 0 ? "first-rib" : "typical-rib" },
+                  <Path d={`M108,${rib.y} C120,${rib.y} ${100 + rib.w},${rib.y + rib.d * 0.5} ${100 + rib.w - 4},${rib.y + rib.d} C${100 + rib.w - 10},${rib.y + rib.d + 2} 112,${rib.y + rib.d * 0.8} 108,${rib.y + 3}`}
+                    fill="none" strokeWidth={1.8} />
+                )}
+              </G>
+            ))}
+
+            {/* ── STERNUM ── */}
+            {B({ name: "Sternum", latinName: "Sternum", region: "thorax", boneId: "sternum" },
+              <>
+                {/* Manubrium */}
+                <Path d="M90,220 C90,216 92,212 100,210 C108,212 110,216 110,220 L110,240 L90,240 Z" />
+                {/* Body */}
+                <Rect x={91} y={240} width={18} height={110} rx={2} />
+                {/* Xiphoid */}
+                <Path d="M96,350 L100,365 L104,350 Z" />
+              </>
+            )}
+
+            {/* ── CLAVICLES ── */}
+            {B({ name: "Clavicle", latinName: "Clavicula", region: "upper-limb", boneId: "clavicle" },
+              <Path d="M94,218 C84,215 70,217 58,221 C48,224 42,222 38,219" fill="none" strokeWidth={3.5} strokeLinecap="round" />
+            )}
+            {B({ name: "Clavicle", latinName: "Clavicula", region: "upper-limb", boneId: "clavicle" },
+              <Path d="M106,218 C116,215 130,217 142,221 C152,224 158,222 162,219" fill="none" strokeWidth={3.5} strokeLinecap="round" />
+            )}
+
+            {/* ── SCAPULAE (triangular, behind ribs) ── */}
+            {B({ name: "Scapula", latinName: "Scapula", region: "upper-limb", boneId: "scapula" },
+              <Path d="M32,222 C28,232 24,280 30,310 C42,312 56,290 60,260 C64,234 60,220 52,218 Z" fill="none" strokeWidth={1.2} />
+            )}
+            {B({ name: "Scapula", latinName: "Scapula", region: "upper-limb", boneId: "scapula" },
+              <Path d="M168,222 C172,232 176,280 170,310 C158,312 144,290 140,260 C136,234 140,220 148,218 Z" fill="none" strokeWidth={1.2} />
+            )}
+
+            {/* ── HUMERI ── */}
+            {B({ name: "Humerus", latinName: "Humerus", region: "upper-limb", boneId: "humerus" },
+              <Path d="
+                M46,222 C40,218 34,219 32,226
+                C30,234 34,242 40,246
+                L34,340 C33,348 34,356 36,360
+                C39,368 46,372 52,370
+                C58,368 62,362 62,354
+                L56,254 C62,250 66,242 64,234
+                C62,226 54,218 46,222 Z
+              " />
+            )}
+            {B({ name: "Humerus", latinName: "Humerus", region: "upper-limb", boneId: "humerus" },
+              <Path d="
+                M154,222 C160,218 166,219 168,226
+                C170,234 166,242 160,246
+                L166,340 C167,348 166,356 164,360
+                C161,368 154,372 148,370
+                C142,368 138,362 138,354
+                L144,254 C138,250 134,242 136,234
+                C138,226 146,218 154,222 Z
+              " />
+            )}
+
+            {/* ── RADII ── */}
+            {B({ name: "Radius", latinName: "Radius", region: "upper-limb", boneId: "radius" },
+              <Path d="
+                M44,374 C40,372 36,374 35,378
+                L32,466 C32,472 35,476 40,477
+                C45,478 49,474 50,468
+                L52,380 C52,375 48,374 44,374 Z
+              " />
+            )}
+            {B({ name: "Radius", latinName: "Radius", region: "upper-limb", boneId: "radius" },
+              <Path d="
+                M156,374 C160,372 164,374 165,378
+                L168,466 C168,472 165,476 160,477
+                C155,478 151,474 150,468
+                L148,380 C148,375 152,374 156,374 Z
+              " />
+            )}
+
+            {/* ── ULNAE ── */}
+            {B({ name: "Ulna", latinName: "Ulna", region: "upper-limb", boneId: "ulna" },
+              <Path d="
+                M54,372 C50,368 46,367 46,372
+                L44,380 C44,380 50,382 52,385
+                L50,468 C50,474 52,478 55,479
+                C58,480 62,476 62,470
+                L62,380 C62,374 58,370 54,372 Z
+              " />
+            )}
+            {B({ name: "Ulna", latinName: "Ulna", region: "upper-limb", boneId: "ulna" },
+              <Path d="
+                M146,372 C150,368 154,367 154,372
+                L156,380 C156,380 150,382 148,385
+                L150,468 C150,474 148,478 145,479
+                C142,480 138,476 138,470
+                L138,380 C138,374 142,370 146,372 Z
+              " />
+            )}
+
+            {/* ── HANDS (simplified) ── */}
+            {B({ name: "Hand Bones", latinName: "Ossa manus", region: "upper-limb", boneId: "radius" },
+              <>
+                {/* Carpals */}
+                <Rect x={29} y={479} width={28} height={14} rx={4} />
+                {/* Metacarpals (5) */}
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Rect key={j} x={29 + j * 6} y={494} width={5} height={24} rx={2} />
+                ))}
+                {/* Phalanges (simplified) */}
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Rect key={j} x={29 + j * 6} y={519} width={5} height={16} rx={2} />
+                ))}
+              </>
+            )}
+            {B({ name: "Hand Bones", latinName: "Ossa manus", region: "upper-limb", boneId: "radius" },
+              <>
+                <Rect x={143} y={479} width={28} height={14} rx={4} />
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Rect key={j} x={143 + j * 6} y={494} width={5} height={24} rx={2} />
+                ))}
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Rect key={j} x={143 + j * 6} y={519} width={5} height={16} rx={2} />
+                ))}
+              </>
+            )}
+
+            {/* ── PELVIS ── */}
+            {B({ name: "Pelvis", latinName: "Pelvis", region: "lower-limb", boneId: "hip-bone" },
+              <>
+                {/* Iliac blades (butterfly shape) */}
+                <Path d="
+                  M100,425 C100,425 92,420 80,418
+                  C64,416 48,418 38,428
+                  C28,438 28,452 36,460
+                  C44,468 58,470 68,466
+                  C78,462 86,456 90,450
+                  C94,444 96,440 100,438
+                  C104,440 106,444 110,450
+                  C114,456 122,462 132,466
+                  C142,470 156,468 164,460
+                  C172,452 172,438 162,428
+                  C152,418 136,416 120,418
+                  C108,420 100,425 100,425 Z
+                " />
+                {/* Pubic symphysis */}
+                <Path d="M86,462 C88,468 92,472 100,474 C108,472 112,468 114,462 L110,458 L100,460 L90,458 Z" />
+                {/* Acetabula (hip sockets - cartilage) */}
+                <Circle cx={68} cy={466} r={10} fill="url(#cart)" stroke={C.cart} />
+                <Circle cx={132} cy={466} r={10} fill="url(#cart)" stroke={C.cart} />
+              </>
+            )}
+
+            {/* ── FEMORA — the most iconic bone ── */}
+            {B({ name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" },
+              <Path d="
+                M66,468 C58,460 54,462 54,470
+                C54,478 60,484 66,484
+                L58,574 C57,584 58,594 62,600
+                C66,608 74,612 80,610
+                C86,608 90,602 90,594
+                L84,504 C90,498 94,490 92,482
+                C90,474 82,466 74,466
+                C72,466 68,467 66,468 Z
+              " />
+            )}
+            {/* Femoral head bump (medial) - left */}
+            {B({ name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" },
+              <Circle cx={60} cy={475} r={10} />
+            )}
+            {B({ name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" },
+              <Path d="
+                M134,468 C142,460 146,462 146,470
+                C146,478 140,484 134,484
+                L142,574 C143,584 142,594 138,600
+                C134,608 126,612 120,610
+                C114,608 110,602 110,594
+                L116,504 C110,498 106,490 108,482
+                C110,474 118,466 126,466
+                C128,466 132,467 134,468 Z
+              " />
+            )}
+            {/* Right femoral head */}
+            {B({ name: "Femur", latinName: "Femur", region: "lower-limb", boneId: "femur" },
+              <Circle cx={140} cy={475} r={10} />
+            )}
+
+            {/* ── PATELLAE ── */}
+            {B({ name: "Patella", latinName: "Patella", region: "lower-limb", boneId: "patella" },
+              <Ellipse cx={72} cy={606} rx={10} ry={8} />
+            )}
+            {B({ name: "Patella", latinName: "Patella", region: "lower-limb", boneId: "patella" },
+              <Ellipse cx={128} cy={606} rx={10} ry={8} />
+            )}
+
+            {/* ── TIBIAE ── */}
+            {B({ name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" },
+              <Path d="
+                M62,614 C55,612 50,618 50,626
+                L50,700 C50,708 54,714 60,715
+                C66,716 72,710 72,704
+                L72,628 C76,624 76,616 72,614
+                C69,613 65,613 62,614 Z
+              " />
+            )}
+            {/* Tibial plateau */}
+            {B({ name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" },
+              <Path d="M50,626 C52,618 58,614 72,614 C74,622 74,628 72,628 L50,628 Z" />
+            )}
+            {B({ name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" },
+              <Path d="
+                M138,614 C145,612 150,618 150,626
+                L150,700 C150,708 146,714 140,715
+                C134,716 128,710 128,704
+                L128,628 C124,624 124,616 128,614
+                C131,613 135,613 138,614 Z
+              " />
+            )}
+            {B({ name: "Tibia", latinName: "Tibia", region: "lower-limb", boneId: "tibia" },
+              <Path d="M150,626 C148,618 142,614 128,614 C126,622 126,628 128,628 L150,628 Z" />
+            )}
+
+            {/* ── FIBULAE ── */}
+            {B({ name: "Fibula", latinName: "Fibula", region: "lower-limb", boneId: "fibula" },
+              <Path d="M78,622 C76,620 74,622 74,628 L74,700 C74,706 76,710 80,710 C84,710 86,706 86,700 L86,628 C86,622 82,620 78,622 Z" />
+            )}
+            {B({ name: "Fibula", latinName: "Fibula", region: "lower-limb", boneId: "fibula" },
+              <Path d="M122,622 C124,620 126,622 126,628 L126,700 C126,706 124,710 120,710 C116,710 114,706 114,700 L114,628 C114,622 118,620 122,622 Z" />
+            )}
+
+            {/* ── FEET ── */}
+            {B({ name: "Foot Bones", latinName: "Ossa pedis", region: "lower-limb", boneId: "tibia" },
+              <>
+                {/* Calcaneus */}
+                <Rect x={46} y={716} width={28} height={12} rx={5} />
+                {/* Talus */}
+                <Rect x={50} y={704} width={22} height={12} rx={3} />
+                {/* Metatarsals (5) */}
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Path key={j} d={`M${48 + j * 5},715 L${46 + j * 5},700`} strokeWidth={2.5} strokeLinecap="round" />
+                ))}
+              </>
+            )}
+            {B({ name: "Foot Bones", latinName: "Ossa pedis", region: "lower-limb", boneId: "tibia" },
+              <>
+                <Rect x={126} y={716} width={28} height={12} rx={5} />
+                <Rect x={128} y={704} width={22} height={12} rx={3} />
+                {[0, 1, 2, 3, 4].map(j => (
+                  <Path key={j} d={`M${152 - j * 5},715 L${154 - j * 5},700`} strokeWidth={2.5} strokeLinecap="round" />
+                ))}
+              </>
+            )}
+
+          </Svg>
+        </Animated.View>
       </View>
     );
   },
@@ -681,35 +489,6 @@ const NativeViewer = forwardRef<SkeletonViewerRef, { onBoneSelect: (b: BoneInfo 
 
 export default SkeletonViewer;
 
-// ─── Styles ──────────────────────────────────────────────────────────────────
-
 const styles = StyleSheet.create({
-  root: { flex: 1 },
-  webBone: {
-    position: "absolute",
-    backgroundColor: "rgba(237, 217, 163, 0.12)",
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: "rgba(237, 217, 163, 0.25)",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  webBoneActive: {
-    backgroundColor: "rgba(255, 136, 0, 0.25)",
-    borderColor: "#ff8800",
-  },
-  webBoneLabel: {
-    fontSize: 9,
-    color: "#ff8800",
-    fontWeight: "700",
-    textAlign: "center",
-  },
-  webHint: {
-    position: "absolute",
-    bottom: 200,
-    left: 0, right: 0,
-    textAlign: "center",
-    color: "rgba(255,255,255,0.18)",
-    fontSize: 11,
-  },
+  root: { flex: 1, backgroundColor: "#1e1e2e" },
 });
