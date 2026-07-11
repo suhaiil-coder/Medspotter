@@ -373,7 +373,7 @@ const SkeletonViewer = forwardRef<SkeletonViewerRef, Props>(function SkeletonVie
     const ndcX =  (lx / w) * 2 - 1;
     const ndcY = -(ly / h) * 2 + 1;
     const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera({ x: ndcX, y: ndcY }, cameraRef.current);
+    raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), cameraRef.current);
     const allMeshes = entriesRef.current.flatMap(e => e.meshes);
     const hits = raycaster.intersectObjects(allMeshes);
     if (hits.length > 0) {
