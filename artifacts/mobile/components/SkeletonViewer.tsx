@@ -28,9 +28,42 @@ const BONE_COLOR  = 0xEDD9A3; // warm ivory/bone
 const CART_COLOR  = 0x7CC8C8; // cartilage: cyan
 const SEL_COLOR   = 0xFF8800; // orange highlight
 
+// ─── Procedural bone texture (Haversian canal pattern + lacunae) ─────────────
+let _boneTexture: THREE.DataTexture | null = null;
+function getBoneTexture(): THREE.DataTexture {
+  if (_boneTexture) return _boneTexture;
+  const W = 128, H = 512;
+  const data = new Uint8Array(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      // Longitudinal striations along bone axis
+      const stripe = Math.sin(x * 0.55) * 9 + Math.sin(x * 1.9 + y * 0.04) * 5;
+      // Fine surface detail / micro-roughness
+      const bump = Math.sin(x * 4.3 + y * 0.35) * 3.5 + Math.cos(x * 2.9 + y * 0.72) * 2.5;
+      // Lacunae — tiny oval pits where osteocytes live
+      const lx = ((x % 17) - 8.5), ly = ((y % 22) - 11);
+      const lacuna = Math.exp(-(lx * lx * 0.35 + ly * ly * 0.2)) * 22;
+      // Osteon rings (Haversian system) — subtle circular banding
+      const osteon = Math.sin(Math.sqrt((x % 40 - 20) ** 2 + (y % 40 - 20) ** 2) * 0.55) * 6;
+      const v = stripe + bump + osteon - lacuna;
+      data[i]   = Math.min(255, Math.max(185, 237 + v));
+      data[i+1] = Math.min(255, Math.max(165, 218 + v));
+      data[i+2] = Math.min(255, Math.max(120, 162 + v * 0.65));
+      data[i+3] = 255;
+    }
+  }
+  _boneTexture = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  _boneTexture.wrapS = THREE.RepeatWrapping;
+  _boneTexture.wrapT = THREE.RepeatWrapping;
+  _boneTexture.needsUpdate = true;
+  return _boneTexture;
+}
+
 function boneMat(color = BONE_COLOR): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial({
-    color, roughness: 0.62, metalness: 0.04,
+    color, roughness: 0.58, metalness: 0.04,
+    map: getBoneTexture(),
   });
 }
 function cartMat(): THREE.MeshStandardMaterial {
